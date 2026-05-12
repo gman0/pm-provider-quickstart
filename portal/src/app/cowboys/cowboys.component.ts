@@ -36,13 +36,16 @@ import {
 } from '@ui5/webcomponents-ngx';
 
 // Import UI5 icons used in the template
+import '@ui5/webcomponents-icons/dist/accept.js';
 import '@ui5/webcomponents-icons/dist/add.js';
 import '@ui5/webcomponents-icons/dist/calendar.js';
 import '@ui5/webcomponents-icons/dist/delete.js';
+import '@ui5/webcomponents-icons/dist/error.js';
+import '@ui5/webcomponents-icons/dist/pending.js';
 import '@ui5/webcomponents-icons/dist/person-placeholder.js';
 import '@ui5/webcomponents-icons/dist/refresh.js';
 
-import { Cowboy, CowboysService, Namespace } from './cowboys.service';
+import { Armament, Cowboy, CowboysService, Namespace } from './cowboys.service';
 
 @Component({
   selector: 'app-cowboys',
@@ -78,11 +81,19 @@ export class CowboysComponent {
 
   public cowboys = signal<Cowboy[]>([]);
   public namespaces = signal<Namespace[]>([]);
+  public armaments = signal<Armament[]>([]);
   public loading = signal<boolean>(true);
   public showAddDialog = signal<boolean>(false);
   public newCowboyName = signal<string>('');
   public newCowboyNamespace = signal<string>('');
   public newCowboyIntent = signal<string>('');
+  // Empty string means "no armament" — the create dialog leaves this unset
+  // by default, and the mutation skips the armamentRef field entirely.
+  public newCowboyArmament = signal<string>('');
+
+  // Tracks existence of each referenced Secret. Keyed by `${namespace}/${name}`,
+  // value is one of 'loading' | 'exists' | 'missing'.
+  public secretStatuses = signal<Record<string, 'loading' | 'exists' | 'missing'>>({});
 
   constructor() {
     // Debug: Log the full Luigi context whenever it changes
@@ -106,7 +117,15 @@ export class CowboysComponent {
       // Show Luigi's loading indicator while fetching data
       LuigiClient.uxManager().showLoadingIndicator();
       this.loadNamespaces();
+      this.loadArmaments();
       this.loadCowboys();
+    });
+  }
+
+  public loadArmaments(): void {
+    this.cowboysService.listArmaments().subscribe({
+      next: (armaments) => this.armaments.set(armaments),
+      error: (err) => console.error('Failed to load armaments:', err),
     });
   }
 
@@ -132,6 +151,7 @@ export class CowboysComponent {
         this.cowboys.set(cowboys);
         this.loading.set(false);
         LuigiClient.uxManager().hideLoadingIndicator();
+        this.refreshSecretStatuses(cowboys);
       },
       error: (err) => {
         console.error('Failed to load cowboys:', err);
@@ -149,6 +169,7 @@ export class CowboysComponent {
   public openAddDialog(): void {
     this.newCowboyName.set('');
     this.newCowboyIntent.set('');
+    this.newCowboyArmament.set('');
     // Pre-select first namespace if available
     if (this.namespaces().length > 0) {
       this.newCowboyNamespace.set(this.namespaces()[0].metadata.name);
@@ -175,6 +196,11 @@ export class CowboysComponent {
     this.newCowboyNamespace.set(select.selectedOption?.value || '');
   }
 
+  public onArmamentChange(event: Event): void {
+    const select = event.target as any;
+    this.newCowboyArmament.set(select.selectedOption?.value || '');
+  }
+
   public confirmAddCowboy(): void {
     const name = this.newCowboyName().trim();
     const namespace = this.newCowboyNamespace().trim();
@@ -198,7 +224,8 @@ export class CowboysComponent {
       return;
     }
 
-    this.cowboysService.createCowboy(name, namespace, intent || undefined).subscribe({
+    const armament = this.newCowboyArmament().trim();
+    this.cowboysService.createCowboy(name, namespace, intent || undefined, armament || undefined).subscribe({
       next: (success) => {
         if (success) {
           LuigiClient.uxManager().showAlert({
@@ -265,6 +292,59 @@ export class CowboysComponent {
       .catch(() => {
         console.log('Cowboy deletion cancelled');
       });
+  }
+
+  public secretKey(namespace: string | undefined, name: string): string {
+    return `${namespace ?? ''}/${name}`;
+  }
+
+  public getSecretStatus(namespace: string | undefined, name: string): 'loading' | 'exists' | 'missing' {
+    return this.secretStatuses()[this.secretKey(namespace, name)] ?? 'loading';
+  }
+
+  /**
+   * Fan out an existence check per unique (namespace, name) referenced by
+   * any cowboy. Statuses start as 'loading' and resolve to 'exists' or 'missing'.
+   */
+  private refreshSecretStatuses(cowboys: Cowboy[]): void {
+    const refs = new Map<string, { name: string; namespace: string }>();
+    for (const c of cowboys) {
+      const namespace = c.metadata.namespace;
+      if (!namespace) continue;
+      for (const ref of c.spec.secretRefs ?? []) {
+        refs.set(this.secretKey(namespace, ref.name), { name: ref.name, namespace });
+      }
+    }
+
+    if (refs.size === 0) {
+      this.secretStatuses.set({});
+      return;
+    }
+
+    const initial: Record<string, 'loading' | 'exists' | 'missing'> = {};
+    for (const key of refs.keys()) {
+      initial[key] = 'loading';
+    }
+    this.secretStatuses.set(initial);
+
+    for (const [key, { name, namespace }] of refs) {
+      this.cowboysService.secretExists(name, namespace).subscribe((exists) => {
+        this.secretStatuses.update((prev) => ({
+          ...prev,
+          [key]: exists ? 'exists' : 'missing',
+        }));
+      });
+    }
+  }
+
+  /**
+   * Look up the catalog Armament for a cowboy's reference. Returns undefined
+   * if the catalog hasn't loaded yet or the referenced armament is gone (the
+   * controller might race with a sync that just deleted the catalog entry).
+   */
+  public armamentFor(name: string | undefined): Armament | undefined {
+    if (!name) return undefined;
+    return this.armaments().find((a) => a.metadata.name === name);
   }
 
   public getInitials(name: string): string {

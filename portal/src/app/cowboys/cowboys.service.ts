@@ -17,6 +17,14 @@ import { Injectable, inject } from '@angular/core';
 import { LuigiContextService } from '@luigi-project/client-support-angular';
 import { from, map, Observable, of, switchMap, catchError, filter } from 'rxjs';
 
+export interface SecretRef {
+  name: string;
+}
+
+export interface ArmamentRef {
+  name: string;
+}
+
 export interface Cowboy {
   metadata: {
     name: string;
@@ -25,9 +33,23 @@ export interface Cowboy {
   };
   spec: {
     intent?: string;
+    secretRefs?: SecretRef[];
+    armamentRef?: ArmamentRef;
   };
   status?: {
     result?: string;
+  };
+}
+
+export interface Armament {
+  metadata: {
+    name: string;
+  };
+  spec: {
+    displayName?: string;
+    kind?: string;
+    damage?: number;
+    range?: number;
   };
 }
 
@@ -42,6 +64,16 @@ export interface CowboyListResponse {
     v1alpha1: {
       Cowboys: {
         items: Cowboy[];
+      };
+    };
+  };
+}
+
+export interface ArmamentListResponse {
+  wildwest_platform_mesh_io: {
+    v1alpha1: {
+      Armaments: {
+        items: Armament[];
       };
     };
   };
@@ -68,11 +100,51 @@ const LIST_COWBOYS_QUERY = `
             }
             spec {
               intent
+              secretRefs {
+                name
+              }
+              armamentRef {
+                name
+              }
             }
             status {
               result
             }
           }
+        }
+      }
+    }
+  }
+`;
+
+const LIST_ARMAMENTS_QUERY = `
+  query ListArmaments {
+    wildwest_platform_mesh_io {
+      v1alpha1 {
+        Armaments {
+          items {
+            metadata {
+              name
+            }
+            spec {
+              displayName
+              kind
+              damage
+              range
+            }
+          }
+        }
+      }
+    }
+  }
+`;
+
+const GET_SECRET_QUERY = `
+  query GetSecret($name: String!, $namespace: String!) {
+    v1 {
+      Secret(name: $name, namespace: $namespace) {
+        metadata {
+          name
         }
       }
     }
@@ -93,26 +165,36 @@ const LIST_NAMESPACES_QUERY = `
   }
 `;
 
-const CREATE_COWBOY_MUTATION = `
-  mutation CreateCowboy($name: String!, $namespace: String!, $intent: String) {
-    wildwest_platform_mesh_io {
-      v1alpha1 {
-        createCowboy(
-          namespace: $namespace
-          object: {
-            metadata: { name: $name }
-            spec: { intent: $intent }
-          }
-        ) {
-          metadata {
-            name
-            namespace
+/**
+ * Build a createCowboy mutation. The `armamentRef` input is omitted entirely
+ * when no armament was picked, rather than passing `null`, because the CRD
+ * gateway maps the graphql input one-to-one to the CRD's openAPI schema and
+ * an explicit `null` on an object field can be rejected by validation.
+ */
+function buildCreateCowboyMutation(includeArmament: boolean): string {
+  const armamentClause = includeArmament ? ', armamentRef: { name: $armamentName }' : '';
+  const armamentVar = includeArmament ? ', $armamentName: String!' : '';
+  return `
+    mutation CreateCowboy($name: String!, $namespace: String!, $intent: String${armamentVar}) {
+      wildwest_platform_mesh_io {
+        v1alpha1 {
+          createCowboy(
+            namespace: $namespace
+            object: {
+              metadata: { name: $name }
+              spec: { intent: $intent${armamentClause} }
+            }
+          ) {
+            metadata {
+              name
+              namespace
+            }
           }
         }
       }
     }
-  }
-`;
+  `;
+}
 
 const DELETE_COWBOY_MUTATION = `
   mutation DeleteCowboy($name: String!, $namespace: String!) {
@@ -240,7 +322,17 @@ export class CowboysService {
    * Create a new Cowboy resource in the specified namespace.
    * Uses GraphQL mutation pattern: create{Kind}(namespace, object)
    */
-  createCowboy(name: string, namespace: string, intent?: string): Observable<boolean> {
+  createCowboy(
+    name: string,
+    namespace: string,
+    intent?: string,
+    armamentName?: string,
+  ): Observable<boolean> {
+    const includeArmament = !!armamentName;
+    const variables: Record<string, unknown> = { name, namespace, intent };
+    if (includeArmament) {
+      variables['armamentName'] = armamentName;
+    }
     return this.getGraphQLConfig().pipe(
       switchMap(({ endpoint, token }) =>
         from(
@@ -248,8 +340,8 @@ export class CowboysService {
             method: 'POST',
             headers: this.buildHeaders(token),
             body: JSON.stringify({
-              query: CREATE_COWBOY_MUTATION,
-              variables: { name, namespace, intent },
+              query: buildCreateCowboyMutation(includeArmament),
+              variables,
             }),
           }).then((res) => res.json())
         )
@@ -261,6 +353,57 @@ export class CowboysService {
         console.error('Error creating cowboy:', error);
         return of(false);
       })
+    );
+  }
+
+  /**
+   * List the cluster-scoped Armament catalog exposed by the provider's
+   * CachedResource. Consumers see these as read-only.
+   */
+  listArmaments(): Observable<Armament[]> {
+    return this.getGraphQLConfig().pipe(
+      switchMap(({ endpoint, token }) =>
+        from(
+          fetch(endpoint, {
+            method: 'POST',
+            headers: this.buildHeaders(token),
+            body: JSON.stringify({
+              query: LIST_ARMAMENTS_QUERY,
+            }),
+          }).then((res) => res.json())
+        )
+      ),
+      map((response: { data: ArmamentListResponse }) => {
+        return response.data?.wildwest_platform_mesh_io?.v1alpha1?.Armaments?.items || [];
+      }),
+      catchError((error) => {
+        console.error('Error fetching armaments:', error);
+        return of([]);
+      })
+    );
+  }
+
+  /**
+   * Check whether a Secret exists in the given namespace.
+   * Returns true if the resource is reachable and present, false if missing
+   * (NotFound) or inaccessible (e.g. forbidden by RBAC).
+   */
+  secretExists(name: string, namespace: string): Observable<boolean> {
+    return this.getGraphQLConfig().pipe(
+      switchMap(({ endpoint, token }) =>
+        from(
+          fetch(endpoint, {
+            method: 'POST',
+            headers: this.buildHeaders(token),
+            body: JSON.stringify({
+              query: GET_SECRET_QUERY,
+              variables: { name, namespace },
+            }),
+          }).then((res) => res.json())
+        )
+      ),
+      map((response: any) => !!response?.data?.v1?.Secret?.metadata?.name),
+      catchError(() => of(false))
     );
   }
 
