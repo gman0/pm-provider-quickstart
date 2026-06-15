@@ -1,0 +1,72 @@
+name: Build and Push Helm Charts
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build-helm-charts:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      matrix:
+        chart:
+          - wildwest-controller
+          - wildwest-portal
+          - wildwest-armament-sync
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+
+      - name: Log in to GHCR
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Helm registry login
+        run: |
+          helm registry login ghcr.io \
+            --username "${{ github.actor }}" \
+            --password "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Resolve chart version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            CHART_VERSION="$(grep '^version:' deploy/helm/${{ matrix.chart }}/Chart.yaml | awk '{print $2}')"
+            SHORT_SHA="${GITHUB_SHA::7}"
+            VERSION="${CHART_VERSION}-dev.${SHORT_SHA}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Update chart dependencies
+        run: helm dependency build deploy/helm/${{ matrix.chart }}
+
+      - name: Lint chart
+        run: helm lint deploy/helm/${{ matrix.chart }}
+
+      - name: Package chart
+        run: |
+          helm package deploy/helm/${{ matrix.chart }} \
+            --version ${{ steps.version.outputs.version }} \
+            --destination /tmp/helm-charts/
+
+      - name: Push chart
+        if: github.event_name == 'push' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)
+        run: |
+          helm push /tmp/helm-charts/${{ matrix.chart }}-${{ steps.version.outputs.version }}.tgz \
+            oci://ghcr.io/platform-mesh/helm-charts
